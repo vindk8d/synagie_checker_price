@@ -1,9 +1,11 @@
 import streamlit as st
 import pandas as pd
 import tempfile
-# from backend.main import html_to_text, extract_prices, validate_csv_structure
+from bs4 import BeautifulSoup
 import io
 import time
+import re
+from functools import lru_cache
 
 # Set page config for better performance
 st.set_page_config(
@@ -17,6 +19,51 @@ if 'processed_data' not in st.session_state:
     st.session_state.processed_data = None
 if 'result_df' not in st.session_state:
     st.session_state.result_df = None
+
+# Cache for HTML parsing and price extraction
+@lru_cache(maxsize=1000)
+def html_to_text(html_content):
+    """Convert HTML to text with caching for better performance."""
+    try:
+        # Use lxml parser for better performance
+        soup = BeautifulSoup(html_content, 'lxml')
+        # Remove script and style elements
+        for script in soup(["script", "style"]):
+            script.decompose()
+        # Get text and normalize whitespace
+        text = soup.get_text(separator=' ', strip=True)
+        # Remove extra whitespace
+        text = ' '.join(text.split())
+        return text
+    except Exception as e:
+        st.error(f"Error converting HTML to text: {str(e)}")
+        return str(html_content)
+
+# Compile regex pattern once for better performance
+PRICE_PATTERN = re.compile(
+    r'(?:(?:[\$₱£€¥₹]|(?:PHP|USD|EUR|GBP|JPY|INR))\s*\d+(?:,\d{3})*(?:\.\d{2})?|\d+(?:,\d{3})*(?:\.\d{2})?\s*(?:[\$₱£€¥₹]|(?:PHP|USD|EUR|GBP|JPY|INR)))',
+    re.IGNORECASE
+)
+
+@lru_cache(maxsize=1000)
+def extract_prices(text):
+    """Extract prices from text with caching for better performance."""
+    if not text:
+        return ''
+    prices = PRICE_PATTERN.findall(text)
+    return ' | '.join(prices) if prices else ''
+
+def validate_csv_structure(df1, df2):
+    """Validate the structure of both files with improved error handling."""
+    df1_columns = df1.columns.tolist()
+    df2_columns = df2.columns.tolist()
+    
+    if len(df1_columns) < 2:
+        raise ValueError("First file must have at least 2 columns (product number and HTML content)")
+    if len(df2_columns) < 4:
+        raise ValueError("Second file must have at least 4 columns (product number and description in 4th column)")
+    
+    return df1_columns[0], df1_columns[1], df2_columns[1], df2_columns[3]
 
 # Cache expensive operations
 @st.cache_data(ttl=3600)  # Cache for 1 hour
