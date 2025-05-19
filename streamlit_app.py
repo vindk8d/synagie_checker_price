@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import tempfile
-from backend.main import html_to_text, extract_prices, validate_csv_structure
+# from backend.main import html_to_text, extract_prices, validate_csv_structure
 import io
 import time
 
