@@ -25,8 +25,8 @@ if 'result_df' not in st.session_state:
 def html_to_text(html_content):
     """Convert HTML to text with caching for better performance."""
     try:
-        # Use lxml parser for better performance
-        soup = BeautifulSoup(html_content, 'lxml')
+        # Use html.parser instead of lxml for better compatibility
+        soup = BeautifulSoup(html_content, 'html.parser')
         # Remove script and style elements
         for script in soup(["script", "style"]):
             script.decompose()
