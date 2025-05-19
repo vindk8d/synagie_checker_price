@@ -10,6 +10,9 @@ from difflib import unified_diff
 import logging
 import csv
 import re
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -27,97 +30,68 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
-@app.get("/")
-async def health_check():
-    return JSONResponse({"status": "ok", "message": "Server is running"})
+# Thread pool for parallel processing
+thread_pool = ThreadPoolExecutor(max_workers=4)
 
+# Cache for HTML parsing and price extraction
+@lru_cache(maxsize=1000)
 def html_to_text(html_content):
+    """Convert HTML to text with caching for better performance."""
     try:
-        soup = BeautifulSoup(html_content, 'html.parser')
-        return soup.get_text(separator=' ', strip=True)
+        # Use lxml parser for better performance
+        soup = BeautifulSoup(html_content, 'lxml')
+        # Remove script and style elements
+        for script in soup(["script", "style"]):
+            script.decompose()
+        # Get text and normalize whitespace
+        text = soup.get_text(separator=' ', strip=True)
+        # Remove extra whitespace
+        text = ' '.join(text.split())
+        return text
     except Exception as e:
         logger.error(f"Error converting HTML to text: {str(e)}")
         return str(html_content)
 
+# Compile regex pattern once for better performance
+PRICE_PATTERN = re.compile(
+    r'(?:(?:[\$₱£€¥₹]|(?:PHP|USD|EUR|GBP|JPY|INR))\s*\d+(?:,\d{3})*(?:\.\d{2})?|\d+(?:,\d{3})*(?:\.\d{2})?\s*(?:[\$₱£€¥₹]|(?:PHP|USD|EUR|GBP|JPY|INR)))',
+    re.IGNORECASE
+)
+
+@lru_cache(maxsize=1000)
 def extract_prices(text):
-    """Extract prices (numbers with currency symbols) from text."""
-    # Pattern to match currency formats:
-    # Must start with currency symbol or have currency symbol after the number
-    # Supports formats like $50, 50$, PHP 50, 50 PHP, ₱50, 50₱
-    price_pattern = r'(?:(?:[\$₱£€¥₹]|(?:PHP|USD|EUR|GBP|JPY|INR))\s*\d+(?:,\d{3})*(?:\.\d{2})?|\d+(?:,\d{3})*(?:\.\d{2})?\s*(?:[\$₱£€¥₹]|(?:PHP|USD|EUR|GBP|JPY|INR)))'
-    prices = re.findall(price_pattern, text, re.IGNORECASE)
+    """Extract prices from text with caching for better performance."""
+    if not text:
+        return ''
+    prices = PRICE_PATTERN.findall(text)
     return ' | '.join(prices) if prices else ''
 
-def get_differences(text1, text2):
+def process_row(args):
+    """Process a single row of data."""
+    row, product_col1, html_col, df2, product_col2, desc_col = args
     try:
-        # Extract prices from both texts
-        prices1 = extract_prices(text1)
-        prices2 = extract_prices(text2)
+        product_number = row[product_col1]
+        html_content = row[html_col]
+        text_content = html_to_text(html_content)
         
-        # Split texts into words for better comparison
-        words1 = text1.split()
-        words2 = text2.split()
-        
-        # Generate differences
-        diff = list(unified_diff(words1, words2, n=0))
-        
-        # Filter out the header lines and format the differences
-        diff = [line for line in diff if not line.startswith('@@') and not line.startswith('---') and not line.startswith('+++')]
-        
-        # Join the differences with spaces
-        return ' '.join(diff), prices1, prices2
+        matching_product = df2[df2[product_col2] == product_number]
+        if not matching_product.empty:
+            product_description = matching_product.iloc[0][desc_col]
+            prices1 = extract_prices(text_content)
+            prices2 = extract_prices(product_description)
+            return [
+                product_number,
+                text_content,
+                product_description,
+                prices1,
+                prices2
+            ]
     except Exception as e:
-        logger.error(f"Error getting differences: {str(e)}")
-        return "Error comparing texts", "", ""
-
-def find_header_row(contents, required_columns, file_extension):
-    """Scan the first 20 rows to find the header row containing all required columns."""
-    if file_extension == 'csv':
-        lines = contents.decode('utf-8').splitlines()
-        reader = csv.reader(lines)
-        for idx, row in enumerate(reader):
-            if all(col in row for col in required_columns):
-                logger.info(f"Detected header row at line {idx}: {row}")
-                return idx
-            if idx > 20:
-                break
-    else:  # Excel
-        import openpyxl
-        wb = openpyxl.load_workbook(io.BytesIO(contents), read_only=True)
-        ws = wb.active
-        for idx, row in enumerate(ws.iter_rows(values_only=True)):
-            if row and all(col in row for col in required_columns):
-                logger.info(f"Detected header row at line {idx}: {row}")
-                return idx
-            if idx > 20:
-                break
-    logger.warning("Header row not found, defaulting to first row.")
-    return 0
-
-async def read_file(file: UploadFile, required_columns=None) -> pd.DataFrame:
-    """Read either CSV or XLSX file into a pandas DataFrame, auto-detecting the header row."""
-    contents = await file.read()
-    file_extension = file.filename.split('.')[-1].lower()
-    if required_columns is None:
-        required_columns = []
-    try:
-        header_row = 0
-        if required_columns:
-            header_row = find_header_row(contents, required_columns, file_extension)
-        if file_extension == 'csv':
-            return pd.read_csv(io.StringIO(contents.decode('utf-8')), header=header_row)
-        elif file_extension == 'xlsx':
-            return pd.read_excel(io.BytesIO(contents), engine='openpyxl', header=header_row)
-        elif file_extension == 'xls':
-            return pd.read_excel(io.BytesIO(contents), engine='xlrd', header=header_row)
-        else:
-            raise ValueError(f"Unsupported file format: {file_extension}. Please upload a CSV or XLSX file.")
-    except Exception as e:
-        logger.error(f"Error reading file {file.filename}: {str(e)}")
-        raise Exception(f"Error reading file {file.filename}: {str(e)}")
+        logger.error(f"Error processing row: {str(e)}")
+    return None
 
 def validate_csv_structure(df1, df2):
-    """Validate the structure of both files"""
+    """Validate the structure of both files with improved error handling."""
     df1_columns = df1.columns.tolist()
     df2_columns = df2.columns.tolist()
     
@@ -140,73 +114,32 @@ async def process_csv(file1: UploadFile = File(...), file2: UploadFile = File(..
         if not file1 or not file2:
             raise HTTPException(status_code=400, detail="Both files are required")
         
-        # Define required columns for each file
-        required_columns1 = ["Product ID"]  # for file1 (HTML content)
-        required_columns2 = ["Product ID", "Product Description"]  # for file2 (Descriptions)
-        
-        # Read the first file (HTML content)
-        logger.info(f"Reading first file: {file1.filename}")
-        df1 = await read_file(file1, required_columns=required_columns1)
-        logger.info(f"First file size: {len(df1)} rows")
-        
-        # Read the second file (Product descriptions)
-        logger.info(f"Reading second file: {file2.filename}")
-        df2 = await read_file(file2, required_columns=required_columns2)
-        logger.info(f"Second file size: {len(df2)} rows")
+        # Read files into DataFrames
+        df1 = pd.read_csv(file1.file) if file1.filename.endswith(".csv") else pd.read_excel(file1.file)
+        df2 = pd.read_csv(file2.file) if file2.filename.endswith(".csv") else pd.read_excel(file2.file)
         
         # Validate file structure and get column names
-        try:
-            product_col1, html_col, product_col2, desc_col = validate_csv_structure(df1, df2)
-        except ValueError as e:
-            logger.error(f"File structure validation failed: {str(e)}")
-            raise HTTPException(status_code=400, detail=str(e))
+        product_col1, html_col, product_col2, desc_col = validate_csv_structure(df1, df2)
         
-        # Process HTML content
+        # Prepare arguments for parallel processing
+        process_args = [(row, product_col1, html_col, df2, product_col2, desc_col) 
+                       for _, row in df1.iterrows()]
+        
+        # Process rows in parallel
         processed_data = []
-        success_count = 0
-        error_count = 0
-        
-        for index, row in df1.iterrows():
-            try:
-                product_number = row[product_col1]
-                html_content = row[html_col]
-                text_content = html_to_text(html_content)
-                
-                # Find matching product in second file
-                matching_product = df2[df2[product_col2] == product_number]
-                if not matching_product.empty:
-                    product_description = matching_product.iloc[0][desc_col]
-                    differences, prices1, prices2 = get_differences(text_content, product_description)
-                    
-                    processed_data.append([
-                        product_number,
-                        text_content,
-                        product_description,
-                        differences,
-                        prices1,
-                        prices2
-                    ])
-                    success_count += 1
-                else:
-                    logger.warning(f"No matching product found for {product_number}")
-                    error_count += 1
-            except Exception as e:
-                logger.error(f"Error processing row {index}: {str(e)}")
-                error_count += 1
-                continue
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(process_row, process_args))
+            processed_data = [r for r in results if r is not None]
         
         if not processed_data:
             logger.error("No data was processed successfully")
             raise HTTPException(status_code=400, detail="No data was processed successfully")
-        
-        logger.info(f"Processing complete. Successfully processed {success_count} rows, {error_count} errors.")
         
         # Create new DataFrame with processed data
         result_df = pd.DataFrame(processed_data, columns=[
             'Product Number',
             'Natural Language Output',
             'Product Description',
-            'Differences',
             'LAZADA PRICES',
             'SHOPEE PRICES'
         ])
@@ -222,9 +155,6 @@ async def process_csv(file1: UploadFile = File(...), file2: UploadFile = File(..
             filename='comparison_results.csv',
             background=None
         )
-    except HTTPException as he:
-        logger.error(f"HTTP Exception: {str(he)}")
-        raise he
     except Exception as e:
         logger.error(f"Error in process_csv: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing files: {str(e)}")
